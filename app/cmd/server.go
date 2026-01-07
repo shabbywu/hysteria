@@ -20,6 +20,7 @@ import (
 	"github.com/libdns/cloudflare"
 	"github.com/libdns/duckdns"
 	"github.com/libdns/gandi"
+	"github.com/libdns/dnspod"
 	"github.com/libdns/godaddy"
 	"github.com/libdns/namedotcom"
 	"github.com/libdns/vultr"
@@ -442,6 +443,12 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
 					DNSProvider: &vultr.Provider{
 						APIToken: c.ACME.DNS.Config["vultr_api_token"],
+					},
+				}
+			case "dnspod":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &dnspod.Provider{
+						APIToken: c.ACME.DNS.Config["dnspod_api_token"],
 					},
 				}
 			default:
