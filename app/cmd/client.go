@@ -474,31 +474,36 @@ func runClientCmd(cmd *cobra.Command, args []string) {
 }
 
 func runClient(viper *viper.Viper) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signalChan)
+
+	errChan := make(chan modeError)
+	runner := initClientRunner(initClientConfig(viper))
+	defer runner.Stop()
+	runner.Run(errChan)
+
+	select {
+	case <-signalChan:
+		logger.Info("received signal, shutting down gracefully")
+	case modeErr := <-errChan:
+		runner.Stop()
+		if modeErr.Err != nil {
+			logger.Fatal(fmt.Sprintf("mode %s stopped", modeErr.Name), zap.Error(modeErr.Err))
+		} else {
+			logger.Fatal(fmt.Sprintf("mode %s stopped", modeErr.Name))
+		}
+	}
+}
+
+func initClientConfig(viper *viper.Viper) (config clientConfig) {
 	if err := viper.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read client config", zap.Error(err))
 	}
-	var config clientConfig
+
 	if err := viper.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
-
-	c, err := client.NewReconnectableClient(
-		config.Config,
-		func(c client.Client, info *client.HandshakeInfo, count int) {
-			connectLog(info, count)
-			// On the client side, we start checking for updates after we successfully connect
-			// to the server, which, depending on whether lazy mode is enabled, may or may not
-			// be immediately after the client starts. We don't want the update check request
-			// to interfere with the lazy mode option.
-			if count == 1 && !disableUpdateCheck {
-				go runCheckUpdateClient(c)
-			}
-		}, config.Lazy)
-	if err != nil {
-		logger.Fatal("failed to initialize client", zap.Error(err))
-	}
-	defer c.Close()
-
 	uri := config.URI()
 	if showQR {
 		logger.Warn("--qr flag is deprecated and will be removed in future release, " +
@@ -506,78 +511,47 @@ func runClient(viper *viper.Viper) {
 		logger.Info("use this URI to share your server", zap.String("uri", uri))
 		utils.PrintQR(uri)
 	}
+	return
+}
 
+func initClientRunner(config clientConfig) *clientModeRunner {
 	// Register modes
-	var runner clientModeRunner
+	runner := &clientModeRunner{
+		GetConfig: config.Config,
+		Lazy:      config.Lazy,
+	}
 	if config.SOCKS5 != nil {
-		runner.Add("SOCKS5 server", func() error {
-			return clientSOCKS5(*config.SOCKS5, c)
-		})
+		runner.Add("SOCKS5 server", wrapHandler(clientSOCKS5, *config.SOCKS5, runner))
 	}
 	if config.HTTP != nil {
-		runner.Add("HTTP proxy server", func() error {
-			return clientHTTP(*config.HTTP, c)
-		})
+		runner.Add("HTTP proxy server", wrapHandler(clientHTTP, *config.HTTP, runner))
 	}
 	if len(config.TCPForwarding) > 0 {
-		runner.Add("TCP forwarding", func() error {
-			return clientTCPForwarding(config.TCPForwarding, c)
-		})
+		runner.Add("TCP forwarding", wrapHandler(clientTCPForwarding, config.TCPForwarding, runner))
 	}
 	if len(config.UDPForwarding) > 0 {
-		runner.Add("UDP forwarding", func() error {
-			return clientUDPForwarding(config.UDPForwarding, c)
-		})
+		runner.Add("UDP forwarding", wrapHandler(clientUDPForwarding, config.UDPForwarding, runner))
 	}
 	if config.TCPTProxy != nil {
-		runner.Add("TCP transparent proxy", func() error {
-			return clientTCPTProxy(*config.TCPTProxy, c)
-		})
+		runner.Add("TCP transparent proxy", wrapHandler(clientTCPTProxy, *config.TCPTProxy, runner))
 	}
 	if config.UDPTProxy != nil {
-		runner.Add("UDP transparent proxy", func() error {
-			return clientUDPTProxy(*config.UDPTProxy, c)
-		})
+		runner.Add("UDP transparent proxy", wrapHandler(clientUDPTProxy, *config.UDPTProxy, runner))
 	}
 	if config.TCPRedirect != nil {
-		runner.Add("TCP redirect", func() error {
-			return clientTCPRedirect(*config.TCPRedirect, c)
-		})
+		runner.Add("TCP redirect", wrapHandler(clientTCPRedirect, *config.TCPRedirect, runner))
 	}
 	if config.TUN != nil {
-		runner.Add("TUN", func() error {
-			return clientTUN(*config.TUN, c)
-		})
+		runner.Add("TUN", wrapHandler(clientTUN, *config.TUN, runner))
 	}
-
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signalChan)
-
-	runnerChan := make(chan clientModeRunnerResult, 1)
-	go func() {
-		runnerChan <- runner.Run()
-	}()
-
-	select {
-	case <-signalChan:
-		logger.Info("received signal, shutting down gracefully")
-	case r := <-runnerChan:
-		if r.OK {
-			logger.Info(r.Msg)
-		} else {
-			_ = c.Close() // Close the client here as Fatal will exit the program without running defer
-			if r.Err != nil {
-				logger.Fatal(r.Msg, zap.Error(r.Err))
-			} else {
-				logger.Fatal(r.Msg)
-			}
-		}
-	}
+	return runner
 }
 
 type clientModeRunner struct {
-	ModeMap map[string]func() error
+	GetConfig  func() (*client.Config, error)
+	Lazy       bool
+	ModeMap    map[string]func() error
+	connection client.Client
 }
 
 type clientModeRunnerResult struct {
@@ -593,33 +567,63 @@ func (r *clientModeRunner) Add(name string, f func() error) {
 	r.ModeMap[name] = f
 }
 
-func (r *clientModeRunner) Run() clientModeRunnerResult {
+type modeError struct {
+	Name string
+	Err  error
+}
+
+func (r *clientModeRunner) Run(errChan chan modeError) clientModeRunnerResult {
 	if len(r.ModeMap) == 0 {
 		return clientModeRunnerResult{OK: false, Msg: "no mode specified"}
 	}
-
-	type modeError struct {
-		Name string
-		Err  error
+	if err := r.ensureConnection(); err != nil {
+		return clientModeRunnerResult{OK: false, Msg: fmt.Sprintf("failed to initialize client %s", err)}
 	}
-	errChan := make(chan modeError, len(r.ModeMap))
+
 	for name, f := range r.ModeMap {
 		go func(name string, f func() error) {
 			err := f()
 			errChan <- modeError{name, err}
 		}(name, f)
 	}
-	// Fatal if any one of the modes fails
-	for i := 0; i < len(r.ModeMap); i++ {
-		e := <-errChan
-		if e.Err != nil {
-			return clientModeRunnerResult{OK: false, Msg: "failed to run " + e.Name, Err: e.Err}
-		}
-	}
-
 	// We don't really have any such cases, as currently none of our modes would stop on themselves without error.
 	// But we leave the possibility here for future expansion.
 	return clientModeRunnerResult{OK: true, Msg: "finished without error"}
+}
+
+func (r *clientModeRunner) Stop() error {
+	if r.connection != nil {
+		return r.connection.Close()
+	}
+	return nil
+}
+
+func (r *clientModeRunner) ensureConnection() (err error) {
+	if r.connection != nil {
+		return nil
+	}
+	r.connection, err = client.NewReconnectableClient(
+		r.GetConfig,
+		func(c client.Client, info *client.HandshakeInfo, count int) {
+			connectLog(info, count)
+			// On the client side, we start checking for updates after we successfully connect
+			// to the server, which, depending on whether Lazy mode is enabled, may or may not
+			// be immediately after the client starts. We don't want the update check request
+			// to interfere with the Lazy mode option.
+			if count == 1 && !disableUpdateCheck {
+				go runCheckUpdateClient(c)
+			}
+		}, r.Lazy)
+	return err
+}
+
+func wrapHandler[T interface{}](callback func(T, client.Client) error, cfg T, r *clientModeRunner) func() error {
+	return func() error {
+		if err := r.ensureConnection(); err != nil {
+			return err
+		}
+		return callback(cfg, r.connection)
+	}
 }
 
 func clientSOCKS5(config socks5Config, c client.Client) error {
