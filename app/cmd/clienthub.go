@@ -1,67 +1,66 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"github.com/apernet/hysteria/app/v2/internal/proxymux"
+	"github.com/apernet/hysteria/app/v2/internal/socks5"
+	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 )
 
-var configFiles []string
+type clientHubConfig struct {
+	// 并行客户端
+	ParallelClientConfigs []clientConfig    `mapstructure:"parallelClients"`
+	RoundRobinConfig      *roundRobinConfig `mapstructure:"roundRobin"`
+}
+
+type roundRobinConfig struct {
+	ClientConfigs []clientConfig `mapstructure:"clients"`
+	HTTP          *httpConfig    `mapstructure:"http"`
+	SOCKS5        *socks5Config  `mapstructure:"socks5"`
+}
+
 var clientHubCmd = &cobra.Command{
 	Use:   "client-hub",
 	Short: "Client Hub mode",
-	Run:   runClientHub,
+	Run:   runClientHubCmd,
 }
 
 func init() {
-	initClientHubFlags()
 	rootCmd.AddCommand(clientHubCmd)
 }
 
-func initClientHubFlags() {
-	clientHubCmd.Flags().StringArrayVar(&configFiles, "configs", []string{"config.yaml"}, "client configs")
+func runClientHubCmd(cmd *cobra.Command, args []string) {
+	logger.Info("client-hub mode")
+	runClientHub(defaultViper)
 }
 
-func runClientHub(cmd *cobra.Command, args []string) {
-	var clientConfigs []clientConfig
-	for _, filename := range configFiles {
-		v := viper.New()
-		cfgPath, err := filepath.Abs(filename)
-		if err != nil {
-			logger.Fatal("failed to parse config file", zap.Error(err))
-		}
-		v.SetConfigFile(cfgPath)
-		if err := v.ReadInConfig(); err != nil {
-			logger.Fatal("failed to read client config", zap.Error(err))
-		}
-
-		var config clientConfig
-		if err := v.Unmarshal(&config); err != nil {
-			logger.Fatal("failed to parse client config", zap.Error(err))
-		}
-		clientConfigs = append(clientConfigs, config)
+func runClientHub(viper *viper.Viper) {
+	var hubConfig clientHubConfig
+	if err := viper.ReadInConfig(); err != nil {
+		logger.Fatal("failed to read client config", zap.Error(err))
 	}
 
-	var hub runnerHub
-	var runResult clientModeRunnerResult
+	if err := viper.Unmarshal(&hubConfig); err != nil {
+		logger.Fatal("failed to parse client config", zap.Error(err))
+	}
+
 	errChan := make(chan modeError)
-	for _, cfg := range clientConfigs {
-		runner := initClientRunner(cfg)
-		hub.runners = append(hub.runners, runner)
-		runResult = runner.Run(errChan)
-		if !runResult.OK {
-			break
-		}
+	var parallelHub *parallelRunnerHub
+	if len(hubConfig.ParallelClientConfigs) > 0 {
+		parallelHub = runParallelRunner(&hubConfig, errChan)
 	}
-	if !runResult.OK {
-		hub.Stop()
-		logger.Fatal(runResult.Msg)
-	}
+	defer parallelHub.Stop()
+
+	roundRobinRunner := newRoundRobinRunner(&hubConfig)
+	roundRobinRunner.Run(errChan)
+	defer roundRobinRunner.Stop()
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
@@ -71,7 +70,8 @@ func runClientHub(cmd *cobra.Command, args []string) {
 	case <-signalChan:
 		logger.Info("received signal, shutting down gracefully")
 	case modeErr := <-errChan:
-		hub.Stop()
+		parallelHub.Stop()
+		roundRobinRunner.Stop()
 		if modeErr.Err != nil {
 			logger.Fatal(fmt.Sprintf("mode %s stopped", modeErr.Name), zap.Error(modeErr.Err))
 		} else {
@@ -80,12 +80,135 @@ func runClientHub(cmd *cobra.Command, args []string) {
 	}
 }
 
-type runnerHub struct {
+type parallelRunnerHub struct {
 	runners []*clientModeRunner
 }
 
-func (h *runnerHub) Stop() {
+func (h *parallelRunnerHub) Stop() {
+	if h == nil {
+		return
+	}
 	for _, runner := range h.runners {
 		runner.Stop()
 	}
+}
+
+func runParallelRunner(hubConfig *clientHubConfig, errChan chan modeError) *parallelRunnerHub {
+	var hub parallelRunnerHub
+	var runResult clientModeRunnerResult
+	for _, cfg := range hubConfig.ParallelClientConfigs {
+		runner := initClientRunner(cfg)
+		hub.runners = append(hub.runners, runner)
+		runResult = runner.Run(errChan)
+		if !runResult.OK {
+			break
+		}
+	}
+	if !runResult.OK && len(hubConfig.ParallelClientConfigs) > 0 {
+		hub.Stop()
+		logger.Fatal(runResult.Msg)
+	}
+	return &hub
+}
+
+func newRoundRobinRunner(hubConfig *clientHubConfig) *roundRobinRunner {
+	if hubConfig.RoundRobinConfig == nil {
+		return nil
+	}
+	runner := &roundRobinRunner{
+		ModeMap:          make(map[string]func() error),
+		connections:      make(map[int]client.Client),
+		roundRobinConfig: hubConfig.RoundRobinConfig,
+	}
+	if hubConfig.RoundRobinConfig.SOCKS5 != nil {
+		runner.ModeMap["SOCKS5 server"] = runner.listenSocket5
+	}
+	if hubConfig.RoundRobinConfig.HTTP != nil {
+
+	}
+	return runner
+}
+
+type roundRobinRunner struct {
+	ModeMap          map[string]func() error
+	roundRobinConfig *roundRobinConfig
+	connections      map[int]client.Client
+}
+
+func (r *roundRobinRunner) listenSocket5() error {
+	config := r.roundRobinConfig.SOCKS5
+	if config.Listen == "" {
+		return configError{Field: "listen", Err: errors.New("listen address is empty")}
+	}
+	l, err := proxymux.ListenSOCKS(config.Listen)
+	if err != nil {
+		return configError{Field: "listen", Err: err}
+	}
+	var authFunc func(username, password string) bool
+	username, password := config.Username, config.Password
+	if username != "" && password != "" {
+		authFunc = func(u, p string) bool {
+			return u == username && p == password
+		}
+	}
+	var servers []*socks5.Server
+	for idx, _ := range r.roundRobinConfig.ClientConfigs {
+		s := &socks5.Server{
+			HyClient:    r.ensureConnection(idx),
+			AuthFunc:    authFunc,
+			DisableUDP:  config.DisableUDP,
+			EventLogger: &socks5Logger{},
+		}
+		servers = append(servers, s)
+	}
+	s := socks5.RoundRobinServer{
+		Servers:     servers,
+		EventLogger: &socks5Logger{},
+	}
+	logger.Info("SOCKS5 server listening", zap.String("addr", config.Listen))
+	return s.Serve(l)
+}
+
+func (r *roundRobinRunner) Run(errChan chan modeError) {
+	if r == nil {
+		return
+	}
+	for name, f := range r.ModeMap {
+		go func(name string, f func() error) {
+			err := f()
+			errChan <- modeError{name, err}
+		}(name, f)
+	}
+}
+
+func (r *roundRobinRunner) Stop() {
+	if r == nil {
+		return
+	}
+	for _, c := range r.connections {
+		c.Close()
+	}
+}
+
+func (r *roundRobinRunner) ensureConnection(idx int) client.Client {
+	if c, ok := r.connections[idx]; ok {
+		return c
+	}
+	c, err := client.NewReconnectableClient(
+		r.roundRobinConfig.ClientConfigs[idx].Config,
+		func(c client.Client, info *client.HandshakeInfo, count int) {
+			connectLog(info, count)
+			// On the client side, we start checking for updates after we successfully connect
+			// to the server, which, depending on whether Lazy mode is enabled, may or may not
+			// be immediately after the client starts. We don't want the update check request
+			// to interfere with the Lazy mode option.
+			if count == 1 && !disableUpdateCheck {
+				go runCheckUpdateClient(c)
+			}
+		}, r.roundRobinConfig.ClientConfigs[idx].Lazy)
+	if err != nil {
+
+	}
+	r.connections[idx] = c
+	return c
 }
