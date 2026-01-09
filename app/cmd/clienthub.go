@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"github.com/apernet/hysteria/app/v2/internal/http"
 	"github.com/apernet/hysteria/app/v2/internal/proxymux"
 	"github.com/apernet/hysteria/app/v2/internal/socks5"
 	"github.com/apernet/hysteria/core/v2/client"
@@ -124,7 +125,7 @@ func newRoundRobinRunner(hubConfig *clientHubConfig) *roundRobinRunner {
 		runner.ModeMap["SOCKS5 server"] = runner.listenSocket5
 	}
 	if hubConfig.RoundRobinConfig.HTTP != nil {
-
+		runner.ModeMap["HTTP server"] = runner.listenHttp
 	}
 	return runner
 }
@@ -153,8 +154,12 @@ func (r *roundRobinRunner) listenSocket5() error {
 	}
 	var servers []*socks5.Server
 	for idx, _ := range r.roundRobinConfig.ClientConfigs {
+		c, err := r.ensureConnection(idx)
+		if err != nil {
+			return err
+		}
 		s := &socks5.Server{
-			HyClient:    r.ensureConnection(idx),
+			HyClient:    c,
 			AuthFunc:    authFunc,
 			DisableUDP:  config.DisableUDP,
 			EventLogger: &socks5Logger{},
@@ -164,6 +169,47 @@ func (r *roundRobinRunner) listenSocket5() error {
 	s := socks5.RoundRobinServer{
 		Servers:     servers,
 		EventLogger: &socks5Logger{},
+	}
+	logger.Info("SOCKS5 server listening", zap.String("addr", config.Listen))
+	return s.Serve(l)
+}
+
+func (r *roundRobinRunner) listenHttp() error {
+	config := r.roundRobinConfig.HTTP
+	if config.Listen == "" {
+		return configError{Field: "listen", Err: errors.New("listen address is empty")}
+	}
+	l, err := proxymux.ListenHTTP(config.Listen)
+	if err != nil {
+		return configError{Field: "listen", Err: err}
+	}
+	var authFunc func(username, password string) bool
+	username, password := config.Username, config.Password
+	if username != "" && password != "" {
+		authFunc = func(u, p string) bool {
+			return u == username && p == password
+		}
+	}
+	if config.Realm == "" {
+		config.Realm = "Hysteria"
+	}
+	var servers []*http.Server
+	for idx, _ := range r.roundRobinConfig.ClientConfigs {
+		c, err := r.ensureConnection(idx)
+		if err != nil {
+			return err
+		}
+		s := &http.Server{
+			HyClient:    c,
+			AuthFunc:    authFunc,
+			AuthRealm:   config.Realm,
+			EventLogger: &httpLogger{},
+		}
+		servers = append(servers, s)
+	}
+	s := http.RoundRobinServer{
+		Servers:     servers,
+		EventLogger: &httpLogger{},
 	}
 	logger.Info("SOCKS5 server listening", zap.String("addr", config.Listen))
 	return s.Serve(l)
@@ -190,9 +236,9 @@ func (r *roundRobinRunner) Stop() {
 	}
 }
 
-func (r *roundRobinRunner) ensureConnection(idx int) client.Client {
+func (r *roundRobinRunner) ensureConnection(idx int) (client.Client, error) {
 	if c, ok := r.connections[idx]; ok {
-		return c
+		return c, nil
 	}
 	c, err := client.NewReconnectableClient(
 		r.roundRobinConfig.ClientConfigs[idx].Config,
@@ -207,8 +253,8 @@ func (r *roundRobinRunner) ensureConnection(idx int) client.Client {
 			}
 		}, r.roundRobinConfig.ClientConfigs[idx].Lazy)
 	if err != nil {
-
+		return nil, err
 	}
 	r.connections[idx] = c
-	return c
+	return c, nil
 }
